@@ -3,6 +3,7 @@ package python
 import (
 	"context"
 	"os"
+	"sort"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -10,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/anchore/syft/syft/file"
+	"github.com/anchore/syft/syft/internal/fileresolver"
 	"github.com/anchore/syft/syft/pkg"
 	"github.com/anchore/syft/syft/pkg/cataloger/internal/dependency"
 )
@@ -723,6 +725,115 @@ func Test_pdmLockDependencySpecifier(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			assert.Equal(t, tt.want, pdmLockDependencySpecifier(tt.p))
+		})
+	}
+}
+
+func Test_wheelEggRelationships_duplicateDistributionName(t *testing.T) {
+	// a distribution installed at the top of a site-packages directory is importable under its name;
+	// a private copy vendored inside another distribution (e.g. setuptools/_vendor/) is not. when both
+	// are catalogued, exactly one of them -- the importable one -- must satisfy other packages'
+	// Requires-Dist, and which one is picked must not vary from run to run.
+	newPkg := func(name, version, metadataPath string, requires ...string) pkg.Package {
+		p := pkg.Package{
+			Name:    name,
+			Version: version,
+			Type:    pkg.PythonPkg,
+			Locations: file.NewLocationSet(
+				file.NewLocationFromCoordinates(file.Coordinates{RealPath: metadataPath}).
+					WithAnnotation(pkg.EvidenceAnnotationKey, pkg.PrimaryEvidenceAnnotation),
+			),
+			Metadata: pkg.PythonPackage{
+				Name:         name,
+				Version:      version,
+				RequiresDist: requires,
+			},
+		}
+		p.SetID()
+		return p
+	}
+
+	const site = "/usr/lib/python3/dist-packages"
+
+	tests := []struct {
+		name string
+		pkgs []pkg.Package
+		// dependant package name -> versions of the packages it should depend on
+		want map[string][]string
+	}{
+		{
+			name: "single provider is unaffected",
+			pkgs: []pkg.Package{
+				newPkg("packaging", "24.0", site+"/packaging-24.0.dist-info/METADATA"),
+				newPkg("gunicorn", "23.0.0", site+"/gunicorn-23.0.0.dist-info/METADATA", "packaging"),
+			},
+			want: map[string][]string{"gunicorn": {"packaging@24.0"}},
+		},
+		{
+			name: "top level install wins over a vendored copy",
+			pkgs: []pkg.Package{
+				newPkg("packaging", "24.0", site+"/packaging-24.0.dist-info/METADATA"),
+				newPkg("packaging", "26.0", site+"/setuptools/_vendor/packaging-26.0.dist-info/METADATA"),
+				newPkg("gunicorn", "23.0.0", site+"/gunicorn-23.0.0.dist-info/METADATA", "packaging"),
+			},
+			want: map[string][]string{"gunicorn": {"packaging@24.0"}},
+		},
+		{
+			name: "top level install wins regardless of catalog order",
+			pkgs: []pkg.Package{
+				newPkg("packaging", "26.0", site+"/setuptools/_vendor/packaging-26.0.dist-info/METADATA"),
+				newPkg("gunicorn", "23.0.0", site+"/gunicorn-23.0.0.dist-info/METADATA", "packaging"),
+				newPkg("packaging", "24.0", site+"/packaging-24.0.dist-info/METADATA"),
+			},
+			want: map[string][]string{"gunicorn": {"packaging@24.0"}},
+		},
+		{
+			name: "equal depth falls back to a stable tiebreak on path",
+			pkgs: []pkg.Package{
+				newPkg("packaging", "26.0", site+"/b/packaging-26.0.dist-info/METADATA"),
+				newPkg("packaging", "24.0", site+"/a/packaging-24.0.dist-info/METADATA"),
+				newPkg("gunicorn", "23.0.0", site+"/gunicorn-23.0.0.dist-info/METADATA", "packaging"),
+			},
+			want: map[string][]string{"gunicorn": {"packaging@24.0"}},
+		},
+		{
+			name: "a package that requires itself via an extra is not linked to itself",
+			pkgs: []pkg.Package{
+				// pyHanko-0.25.3.dist-info/METADATA carries:
+				//   Requires-Dist: pyHanko[async-http,...]; extra == "live-test"
+				newPkg("pyhanko", "0.25.3", site+"/pyHanko-0.25.3.dist-info/METADATA", "pyhanko[async-http]", "click>=8.1.3"),
+				newPkg("click", "8.5.0", site+"/click-8.5.0.dist-info/METADATA"),
+			},
+			want: map[string][]string{"pyhanko": {"click@8.5.0"}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// the same input must produce the same graph every time: Go randomizes map iteration
+			// order, so a single pass is not enough to catch a regression here
+			for i := 0; i < 50; i++ {
+				pkgs := make([]pkg.Package, len(tt.pkgs))
+				copy(pkgs, tt.pkgs)
+
+				_, rels, err := wheelEggRelationships(context.Background(), fileresolver.Empty{}, pkgs, nil, nil)
+				require.NoError(t, err)
+
+				got := make(map[string][]string)
+				for _, rel := range rels {
+					from, ok := rel.From.(pkg.Package)
+					require.True(t, ok)
+					to, ok := rel.To.(pkg.Package)
+					require.True(t, ok)
+					// relationships are DependencyOf, so "to" is the dependant
+					got[to.Name] = append(got[to.Name], from.Name+"@"+from.Version)
+				}
+				for k := range got {
+					sort.Strings(got[k])
+				}
+
+				require.Equal(t, tt.want, got, "iteration %d", i)
+			}
 		})
 	}
 }

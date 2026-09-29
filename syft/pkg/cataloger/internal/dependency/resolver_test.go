@@ -70,6 +70,22 @@ func Test_resolve(t *testing.T) {
 			},
 		},
 		{
+			name: "does not create self-relationships",
+			s: newSpecifierBuilder().
+				// a package that both provides and requires the same resource, e.g. a python
+				// distribution that references itself to pull in its own extras
+				// ("Requires-Dist: foo[bar]; extra == ...") from within foo's own METADATA
+				WithProvides(a /* provides */, "a-resource").
+				WithRequires(a /* requires */, "a-resource").
+				WithRequires(b /* requires */, "a-resource").
+				Specifier(),
+			want: map[string][]string{
+				"b": /* depends on */ {"a"},
+				// note: we're NOT seeing:
+				// "a": /* depends on */ {"a"},
+			},
+		},
+		{
 			name: "deduplicates crafted relationships",
 			s: newSpecifierBuilder().
 				WithProvides(a /* provides */, "a1-resource", "a2-resource", "a3-resource").

@@ -3,7 +3,9 @@ package python
 import (
 	"context"
 	"fmt"
+	"math"
 	"path"
+	"sort"
 	"strings"
 
 	"github.com/anchore/syft/internal"
@@ -209,6 +211,9 @@ func wheelEggRelationships(ctx context.Context, resolver file.Resolver, pkgs []p
 		if pkgsBySitePackageAndName[sitePackagesDir] == nil {
 			pkgsBySitePackageAndName[sitePackagesDir] = make(map[string]pkg.Package)
 		}
+		if existing, collision := pkgsBySitePackageAndName[sitePackagesDir][p.Name]; collision {
+			p = preferImportable(existing, p)
+		}
 		pkgsBySitePackageAndName[sitePackagesDir][p.Name] = p
 	}
 
@@ -268,16 +273,77 @@ func wheelEggRelationships(ctx context.Context, resolver file.Resolver, pkgs []p
 	return pkgs, relationshipIndex.All(), err
 }
 
+// preferImportable deterministically selects which of two packages claiming the same distribution
+// name within the same site-packages directory should take part in dependency resolution.
+//
+// Only one distribution of a given name is importable from a site-packages root: the one installed
+// directly in it. Copies nested deeper are vendored private copies (e.g.
+// "setuptools/_vendor/packaging-26.0.dist-info" next to a real "packaging-24.0.dist-info") and are
+// not importable under that name, so they must not satisfy another package's Requires-Dist. Prefer
+// the shallowest installation, then break any remaining tie on the location path and finally on the
+// package ID, so that the choice never depends on the order in which packages were catalogued.
+func preferImportable(a, b pkg.Package) pkg.Package {
+	if installRank(a).less(installRank(b)) {
+		return a
+	}
+	return b
+}
+
+type packageInstallRank struct {
+	depth int
+	path  string
+	id    string
+}
+
+func (r packageInstallRank) less(o packageInstallRank) bool {
+	if r.depth != o.depth {
+		return r.depth < o.depth
+	}
+	if r.path != o.path {
+		return r.path < o.path
+	}
+	return r.id < o.id
+}
+
+// installRank describes how "top level" a package's installation is: the number of directories
+// between the filesystem root and the metadata directory that provides the package.
+func installRank(p pkg.Package) packageInstallRank {
+	locs := packagePrimaryLocations(p)
+	if len(locs) == 0 {
+		locs = p.Locations.ToSlice()
+	}
+
+	rank := packageInstallRank{depth: math.MaxInt, id: string(p.ID())}
+	for _, l := range locs {
+		dir := path.Dir(strings.Trim(l.RealPath, "/"))
+		depth := strings.Count(dir, "/")
+		if depth < rank.depth || (depth == rank.depth && dir < rank.path) {
+			rank.depth = depth
+			rank.path = dir
+		}
+	}
+	return rank
+}
+
 func collectPackages(pkgsBySitePackageAndName map[string]map[string]pkg.Package, sites []string) []pkg.Package {
 	// get packages for all sites, preferring packages from earlier sites for packages with the same name
 
 	pkgByName := make(map[string]struct{})
 	var pkgs []pkg.Package
 	for _, site := range sites {
-		for name, p := range pkgsBySitePackageAndName[site] {
+		// note: iterate over sorted names (not the map directly) so that the order of the packages
+		// handed to the resolver -- and therefore the order of the relationships it produces -- does
+		// not depend on Go's randomized map iteration order
+		names := make([]string, 0, len(pkgsBySitePackageAndName[site]))
+		for name := range pkgsBySitePackageAndName[site] {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+
+		for _, name := range names {
 			if _, ok := pkgByName[name]; !ok {
 				pkgByName[name] = struct{}{}
-				pkgs = append(pkgs, p)
+				pkgs = append(pkgs, pkgsBySitePackageAndName[site][name])
 			}
 		}
 	}

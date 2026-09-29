@@ -69,7 +69,16 @@ func Resolve(specifier Specifier, pkgs []pkg.Package) (relationships []artifact.
 		specs := specsByPkg[dependantPkg.ID()]
 		for _, spec := range specs {
 			for _, resource := range deduplicate(spec.Requires) {
-				for providingPkgID := range pkgsProvidingResource[resource] {
+				// note: iterate over a sorted slice (not the set directly) so that the order of the
+				// resulting relationships does not depend on Go's randomized map iteration order
+				for _, providingPkgID := range pkgsProvidingResource[resource].ToSlice() {
+					// a package cannot be a dependency of itself: this happens legitimately in several
+					// ecosystems, e.g. a python distribution that references itself to pull in its own
+					// extras ("Requires-Dist: foo[bar]; extra == ...") inside foo's own METADATA.
+					if providingPkgID == dependantPkg.ID() {
+						continue
+					}
+
 					// prevent creating duplicate relationships
 					pairKey := string(providingPkgID) + "-" + string(dependantPkg.ID())
 					if seen.Has(pairKey) {
